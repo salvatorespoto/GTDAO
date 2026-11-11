@@ -1,0 +1,23 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "0.1.0",
+	"FriendlyName": "GTDAO",
+	"Description": "GTAO-style screen-space ambient occlusion plus a few Global Distance Field samples, through the Dynamic GI 'Plugin' hook. A learning project.",
+	"Category": "Rendering",
+	"CreatedBy": "Salvatore Spoto",
+	"EngineVersion": "5.8.0",
+	"CanContainContent": false,
+	"IsBetaVersion": true,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "GTDAO",
+			"Type": "Runtime",
+			"LoadingPhase": "PostConfigInit",
+			"PlatformAllowList": [
+				"Win64"
+			]
+		}
+	]
+}

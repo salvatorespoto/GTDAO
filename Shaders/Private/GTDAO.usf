@@ -1,0 +1,486 @@
+// Copyright (c) 2026 Salvatore Francesco Spoto
+// SPDX-License-Identifier: MIT (see LICENSE at the repository root)
+// Horizon-based Ambient Occlusion
+
+// The AMBIENT OCCLUSION buffer is the fraction of the indirect light that is not occluded. 
+// Indeed it's brighter (higher values) where unoccluded and it's darker where occluded.
+// For ambient occlusion we do not consider direct lighting, whose occlusions are the shadows.
+// Once upon a time, in Crysis fon instance, ambient occlusion was used also to occlude the direct lighting,
+// as a sort of replacement of near shadows, but that generates artifacts.
+
+// THE ALGORITHM: for each pixel the algorithm marches the z-buffer in some random directions to find the horizons. 
+// It use the UE HZB to accelerate the search.
+// Once the horizons are found, the unoccluded contribution is computed analytically.
+// Optionally, a separate pass (SampleDistanceFieldCS, optionally at lower resolution)
+// samples the distance field with cosine-weighted rays to find occlusions that are not visible in screen
+// space; GTDAOCS upsamples it and multiplies it into the AO.
+
+// Set the following cVar to be SURE THAT DISTANCE FIELDS ARE BUILT:
+// - r.GenerateMeshDistanceFields 1  (restart editor)
+// - r.DistanceFieldAO 1
+// - showflag.DistanceFieldAO 0 (to hide DFAO)
+// - r.AOGlobalDistanceField.DetailedNecessityCheck 0: with GI method 3 and no DFAO user in the scene UE would skip the Global SDF
+// - r.GTDAO.DF 1
+
+// Do the following stesp to disable ALL THE OTHER AMBIENT OCCLUSION METHODS and SEE THIS ONE in the Ambient Occlusion buffer in editor
+// (Buffer Visualization > Ambient Occlusion shows UE's ScreenSpaceAO texture, which GTDAO overwrites):
+// - r.DynamicGlobalIlluminationMethod 3: GI = Plugin, so Lumen GI (and its short-range AO) is off
+//   and our hook runs
+// - r.AmbientOcclusion.Method 0: SSAO path (1 = GTAO, which writes the AO texture on its own)
+// - r.AmbientOcclusionLevels 0: UE's SSAO does not run (it would be overwritten anyway, but costs ~0.14 ms)
+// - r.GTDAO.AO 1
+// To also see it in the LIT image (UE applies the AO only to the movable Sky Light diffuse):
+// - a movable Sky Light in the level, with Cast Ray Traced Shadow disabled: otherwise the sky diffuse
+//   goes through RayTracingSkyLight and the AO texture is ignored
+// - ShowFlag.DistanceFieldAO 0: DFAO is combined with min(), it usually wins and hides ours.
+//   Do not use r.DistanceFieldAO 0: it removes the Global SDF too (r.GTDAO.DF would do nothing)
+// - ShowFlag.AmbientOcclusion 0 is not a clean switch: it also disables DFAO
+
+// Get the Global Distance Field data from the View uniform buffer
+#define DISTANCE_FIELD_IN_VIEW_UB 1
+
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/DeferredShadingCommon.ush"
+#include "/Engine/Private/Random.ush"
+#include "/Engine/Private/MonteCarlo.ush"
+#include "/Engine/Private/DistanceField/GlobalDistanceFieldShared.ush"
+#include "/Engine/Private/DistanceField/GlobalDistanceFieldUtils.ush"
+
+//// COMPILE-TIME SETTINGS, defined in C++ (GTDAO namespace in GTDAORenderer.cpp, set in
+//// FGTDAOCS::ModifyCompilationEnvironment)
+// MAX_RADIUS_PIXELS: clamp of the projected search radius, in pixels
+// THICKNESS_BLEND: weight of the old horizon when a sample is lower than it (thickness heuristic)
+// USE_HZB: 1 = the far samples read the HZB (mip 0 = half resolution, furthest depth of each texel)
+// DF_CONE_TAN: tan of the half angle of the DF cones (set in FGTDAOSampleDistanceFieldCS::ModifyCompilationEnvironment)
+// USE_DF_TEXTURE: permutation of GTDAOCS, 1 = multiply the AO by the DF visibility of DFTexture
+
+//// GTAO PARAMETERS
+// Effect Radius in UU
+float  Radius;
+// Number of slices per pixel
+int    NumSlices;
+// Number of steps per side of a slice
+int    NumSteps;
+// UE's HZB, read only when USE_HZB is 1
+Texture2D HZBTexture;
+// Post Process Volume AO Intensity: scales the occlusion (1 - AO), 0 = no AO, 1 = full AO
+float  AOIntensity;
+
+//// DISTANCE FIELD PARAMETERS
+// Number of rays per DF texel.
+int    DFRaysPerTexel;
+// Where the distance fields rays start, in UU.
+float  DFMinDistance;
+// Where the distance fields rays end, in UU.
+float  DFMaxDistance;
+// 1 = one DF texel per pixel, 2 = one per 2x2 pixels, ...
+int    DFDownsampleFactor;
+// The DF texture (R16F), written by SampleDistanceFieldCS: DF visibility (1 = unoccluded)
+RWTexture2D<float> OutDF;
+// Read by GTDAOCS (USE_DF_TEXTURE 1), with a bilinear sampler (clamped at the borders)
+Texture2D DFTexture;
+SamplerState DFSampler;
+
+//// Shared by the compute passes
+// Size of the texture the pass writes (the view rect, or the DF texture): extra threads (groups are 8x8) return early
+int2   OutputSize;
+
+//// GTDAOCS
+// Raw AO, one channel
+RWTexture2D<float> OutAO;
+
+//// GTDAOCompositePS
+// The AO to copy into UE's AO texture, one channel
+Texture2D AOTexture;
+
+//// RANDOM NUMBER GENERATORS
+
+// R2 dither from Martin Roberts that generates well distributed (low-discrepancy) quasi-random numbers. Used for the slice angle.
+float R2Dither(float2 PixelPos, float FrameIndex)
+{
+	const float2 Alpha = float2(0.7548776662, 0.5698402910);
+	return frac(dot(PixelPos, Alpha) + FrameIndex * 0.6180339887);
+}
+
+// We use 2 different random generators, R2Dither and InterleavedGradientNoise, one for the slice angle and one for an offset when stepping, to decorrelate these two values. 
+// The third value picks the distance field rays.
+float3 GetGTDAONoise(float2 PixelPos)
+{
+	const float Frame = View.StateFrameIndexMod8;
+	// Slice angle
+	float SliceNoise  = R2Dither(PixelPos, Frame);                  
+	// Step offset while marching the slice 
+	float OffsetNoise = InterleavedGradientNoise(PixelPos, Frame);
+	// Get a random ray direction, to sample the distance field rays
+	float RayNoise = InterleavedGradientNoise(PixelPos + float2(13, 71), Frame);
+	return float3(SliceNoise, OffsetNoise, RayNoise);
+}
+
+// Converts pixel coordinates to 3D coordinates in view (camera) space.
+float3 CameraSpacePositionFromPixelPosition(float2 PixelPos, float SceneDepth)
+{
+	// The common 3D rasterization pipeline is:
+	// Local Space -> World Space -> Camera Space (coordinates centered on the camera) -> Clip Space -> perspective division by w -> NDC 
+	// Here we walk it backwards: first we convert the pixel coordinates to UV, then to NDC.
+	// Then we invert the projection and get the 3D position using the NDC coordinates and the depth.
+
+	// Go from the pixel position to NDC
+	// Here the conversions we do are: Pixel position -> UV [0,1] -> [0,2] (x) / [0,-2] (y) -> [-1,1] that is NDC
+	// 1. (PixelPos - View.ViewRectMin.xy): pixel coordinates relative to the view
+	// 2. Multiplying by the inverse view size gives UV coordinates in the view
+	// 3. Multiplying by float2(2, -2) stretches both axes and flips y. This is because UV grows
+	//    toward the bottom, while NDC grows toward the top
+	// 4. Finally shift to the range [-1,1] and get NDC
+	const float2 ScreenPos = (PixelPos - View.ViewRectMin.xy) * View.ViewSizeAndInvSize.zw * float2(2, -2) + float2(-1, 1);
+
+	// Then go from NDC and depth back to camera space.
+	// 
+	// The perspective matrix (from camera space to clip space) in UE is
+	//		[ M00   0    0   0 ]
+	// M  =	[  0   M11   0   0 ]
+	//  	[ M20  M21   A   1 ]
+	//		[  0    0    B   0 ]
+	// The point P in camera space is pre-multiplied, P * M, obtaining:
+	// - clip.x = x·M00 + z·M20
+	// - clip.y = y·M11 + z·M21
+	// - clip.w = z (this is used in the perspective divide)
+	// After the perspective divide we go from clip space to NDC:
+	// NDC.x = x·M00/z + M20   →   x = (NDC.x − M20) · z / M00
+	// NDC.y = y·M11/z + M21   →   y = (NDC.y − M21) · z / M11
+	//
+	// So we go in the other direction, but first we have to consider that TAA and TSR use a 'jitter'
+	// to slightly move the pixel from frame to frame, accumulating samples for the anti-aliasing,
+	// so the current frame has been shifted. The jitter is in M20 and M21, which otherwise are
+	// usually zero (they are non-zero also for off-center projections, e.g. VR). We remove both.
+	// Going back, solving for x:
+	// remove the jitter:             NDC.x − M20 = x · M00 / z
+	// multiply by z:                 (NDC.x − M20) · z = x · M00
+	// finally divide by M00:         x = (NDC.x − M20) · z / M00
+	// Same for y, since in the y column only M11 and M21 are non-zero:
+	// clip.y = x·M01 + y·M11 + z·M21 + 1·M31 = 0 + y·M11 + z·M21 + 0
+	// Here SceneDepth is z.
+	const float M00 = View.ViewToClip[0][0];   // x scale (horizontal FOV and aspect ratio)
+	const float M11 = View.ViewToClip[1][1];   // y scale (vertical FOV)
+	const float M20 = View.ViewToClip[2][0];   // x jitter / off-center
+	const float M21 = View.ViewToClip[2][1];   // y jitter / off-center
+	const float Z   = SceneDepth;
+	const float X = (ScreenPos.x - M20) * Z / M00;
+	const float Y = (ScreenPos.y - M21) * Z / M11;
+
+	// X, Y are camera-space coordinates; the scene depth is the distance along Z from the camera.
+	// Together they give the final 3D position relative to the camera.
+	return float3(X, Y, Z);
+}
+
+// Compute the integral of part of the unoccluded arc from one horizon to V (the camera)
+// See reference slides in the project for the derivation.
+float IntegrateArc(float h, float n)
+{
+	return 0.25 * (-cos(2.0 * h - n) + cos(n) + 2.0 * h * sin(n));
+}
+
+// One sample of the march: updates the horizon of one side.
+void MarchSample(float2 TargetPos, float Distance, float3 P, float3 V, inout float MaxCos)
+{
+	// Snap to the pixel center because we load the value without filters
+	float2 SamplePos = floor(TargetPos) + 0.5;
+
+	// Check that the sample is on screen
+	const bool bOnScreen = all(SamplePos >= View.ViewRectMin.xy) &&
+		all(SamplePos < View.ViewRectMin.xy + View.ViewSizeAndInvSize.xy);
+
+	// Load the sample depth, UE uses reversed Z: far plane = 0.
+	float DeviceZ;
+#if USE_HZB
+	// Use the HZB only if the sample is more than 4 pixels away (avoid for very close pixels)
+	if (Distance >= 4.0)
+	{
+		// Choose the mip from the distance in pixels between the sample and P: 4-8 px mip 0, 8-16 px mip 1, then mip 2.
+		const int Mip = min(int(log2(Distance * 0.25)), 2);
+		// The HZB starts from the corner of the view, not of the buffer (that can be larger); mip 0 is half resolution
+		const int2 Texel = int2((SamplePos - View.ViewRectMin.xy) * 0.5) >> Mip;
+		// Load the (furthest) z from the selected HZB mip
+		DeviceZ = HZBTexture.Load(int3(Texel, Mip)).r;
+		// The depth belongs to the center of the HZB texel, not to the pixel we asked for:
+		// move the sample there to get a better approximation.
+		// Basically, we march pixels, but land on mips.
+		SamplePos = View.ViewRectMin.xy + (float2(Texel) + 0.5) * float(2 << Mip);
+	}
+	else
+	{
+		DeviceZ = SceneTexturesStruct.SceneDepthTexture.Load(int3(SamplePos, 0)).r;
+	}
+#else
+	DeviceZ = SceneTexturesStruct.SceneDepthTexture.Load(int3(SamplePos, 0)).r;
+#endif
+
+	// Get the 3D pixel coordinates of the sample in camera space
+	const float3 Ps = CameraSpacePositionFromPixelPosition(SamplePos, ConvertFromDeviceZ(max(DeviceZ, 1e-6)));
+	// Compute the distance from the sample to the pixel
+	const float3 Delta = Ps - P;
+	const float DeltaLen = length(Delta);
+	// How high the sample is, seen from P: cosine of its angle from V.
+	float CosH = dot(Delta, V) / DeltaLen;
+
+	// Falloff: give less weight to the samples that are farther away.
+	// An invalid sample gets the full falloff, so it leaves the horizon as it is.
+	const float Falloff = (bOnScreen && DeviceZ > 0.0) ? saturate(DeltaLen / Radius * 2.0 - 1.0) : 1.0;
+	CosH = lerp(CosH, MaxCos, Falloff);
+
+	// Save the highest cosine (the horizon), but a lower sample pulls it down a little.
+	// This is the GTAO thickness heuristic to mitigate thin occluders detached from the background
+	// acting as if they had infinite z thickness.
+	MaxCos = CosH > MaxCos ? CosH : lerp(CosH, MaxCos, THICKNESS_BLEND);
+}
+
+// Distance field visibility from a few fixed "cone" samples (instead of a ray march), in SampleDistanceFieldCS
+
+// DF_CONE_SAMPLES reads of the distance field at fixed distances along the ray, in a
+// geometric progression from MinDistance to MaxDistance (jittered per pixel and frame). Around the
+// ray we imagine a cone with radius t * DF_CONE_TAN at distance t: the distance d to the nearest
+// surface at the sample tells how much of the cone section is free, saturate(d / radius).
+// The visibility of the ray is the smallest of them (like UE's DFAO and soft shadows).
+// Fixed cost, no divergence (sphere tracing has a scene-dependent number of steps, and a warp
+// waits for its slowest pixel); the result is a soft, approximate occlusion.
+#define DF_CONE_SAMPLES 4
+
+// Compute Ambient Occlusion
+// The value returned is in the range [0,1]: 1 = unoccluded, 0 = fully occluded.
+// Screen space only: the distance field is sampled by SampleDistanceFieldCS and multiplied in GTDAOCS.
+float ComputeGTDAO(float2 PixelPos, float3 P, float3 N, float3 Noise)
+{
+
+	// V: versor from the pixel point TO the camera. Camera is the origin -> (0,0,0) - P = -P.
+	const float3 V = normalize(-P);
+
+	// The AO radius is given as parameter in world units (UU) so we should convert it into pixels to get the marching radius
+	// Pixels covered by a camera-space length of 1 at z = 1: 
+	// ...*View.ViewToClip[1][1] = 1/tan(FOVy/2) maps length/z to NDC
+	// 0.5*View.ViewSizeAndInvSize.y*... (that contains the size of the viewport in pixels) maps NDC to pixels.
+	// The result is the number of pixels covered by a camera-space length of 1 at z = 1 ...
+	const float ProjScale = 0.5 * View.ViewSizeAndInvSize.y * View.ViewToClip[1][1];
+	// ... ProjScale/P.z then dividing by z we obtain the number of pixels covered by a camera-space length of 1 at P.z.
+	// Finally, multiplying by Radius we obtain the number of pixels of that radius (in world units) at
+	// that distance.
+	const float RadiusPixels = min(Radius * ProjScale / P.z, MAX_RADIUS_PIXELS);
+	// Too far, the marching radius is too small to march, return 1.0 (unoccluded).
+	if (RadiusPixels < 1.0)
+		return 1.0;
+
+	float Visibility = 0;
+
+	// March the slices
+	for (int Slice = 0; Slice < NumSlices; ++Slice)
+	{
+		// Generate random slice direction
+		const float Phi = (Slice + Noise.x) * PI / NumSlices;
+		const float2 Dir = float2(cos(Phi), sin(Phi));
+
+		// Create a local reference system for the slice around the point P:
+		// Tperp: slice direction orthogonal to V
+		// V: direction from the pixel P toward the camera
+		// Axis: perpendicular to V and Tperp 
+		const float3 T = float3(Dir, 0);
+		const float3 Axis = normalize(cross(T, V));
+		const float3 TPerp = cross(V, Axis);
+
+		// Compute the Normal projected onto the slice plane
+		// 1. Remove the normal's component not on the slice plane
+		const float3 Np = N - Axis * dot(N, Axis);
+		// |Np|: length of the projected normal, that is practically the slice weight
+		const float Len = length(Np); 
+		// 2. Get the signed angle between Np and V (the direction toward the camera). 
+		// max(Len, 1e-4) to avoid division by zero.
+		// sign(dot(Np, TPerp)) to get the sign of the angle, acos returns only positive angles
+		const float Gamma = sign(dot(Np, TPerp)) * acos(clamp(dot(Np, V) / max(Len, 1e-4), -1.0, 1.0));
+		 
+		// March the slice: one loop walks both sides together
+		float MaxCos0 = -1.0;	// Store the maximum horizon found so far, side +T
+		float MaxCos1 = -1.0;	// Same, side -T
+		const float2 StepDir = float2(Dir.x, -Dir.y);
+		for (int Step = 0; Step < NumSteps; ++Step)
+		{
+			// Use a quadratic distribution so the samples are denser close to the pixel,
+			// for details like contacts or creases, and sparse far away.
+			// The Noise.y shifts the steps per pixel so neighbours sample different distances
+			float t = (Step + Noise.y) / NumSteps;
+			t = t * t;
+			// The step should be at least 1 pixel
+			const float Distance = max(1.0, t * RadiusPixels);
+
+			MarchSample(PixelPos + StepDir * Distance, Distance, P, V, MaxCos0);
+			MarchSample(PixelPos - StepDir * Distance, Distance, P, V, MaxCos1);
+		}
+
+		// Get the two horizons h0 and h1 as angles from V
+		float h1 =  acos(MaxCos0);
+		float h0 = -acos(MaxCos1);
+
+		// (h0 - Gamma) and (h1 - Gamma) are the horizon angles measured from the projected normal Np
+		// Remember Gamma is the angle between Np and V.
+		// Directions more than PI/2 away from Np are below the surface, so we clamp them in [-pi/2,pi/2].
+		h1 = Gamma + min(h1 - Gamma,  0.5 * PI);
+		h0 = Gamma + max(h0 - Gamma, -0.5 * PI);
+
+		// Integrate the visible arc between the two horizons (cosine-weighted, closed form),
+		// weighted by Len = |Np| (how much of the normal lies in this slice).
+		Visibility += Len * (IntegrateArc(h0, Gamma) + IntegrateArc(h1, Gamma));
+	}
+
+	// Compute the average visibility Visibility / NumSlices.
+	// Saturate to keep the result in [0,1] range.
+	return saturate(Visibility / NumSlices);
+}
+
+// Buffer position (pixel center) of a pixel of the view: the view can start inside a larger buffer
+float2 ViewPixelToBufferPos(uint2 ViewPixel)
+{
+	return float2(ViewPixel) + View.ViewRectMin.xy + 0.5;
+}
+
+//// DISTANCE FIELD
+
+// One DF texel covers DFDownsampleFactor x DFDownsampleFactor pixels. Its rays start from one pixel
+// of the block, its "source" pixel: the center one, clamped inside the view (last partial block).
+uint2 DFTexelToViewPixel(uint2 Texel)
+{
+	const uint2 ViewSize = uint2(View.ViewSizeAndInvSize.xy);
+	return min(Texel * DFDownsampleFactor + DFDownsampleFactor / 2, ViewSize - 1);
+}
+
+// Size of the DF texture: the view size divided by the factor, rounded up (same as in C++)
+int2 GetDFTextureSize()
+{
+	return (int2(View.ViewSizeAndInvSize.xy) + DFDownsampleFactor - 1) / DFDownsampleFactor;
+}
+
+// Upsample: DF visibility of a full resolution pixel, plain bilinear filtering of the DF texture.
+// No edge-stopping weights: at a depth edge (e.g. a chair leg in front of a wall) the two surfaces
+// mix over one DF block. With DFDownsampleFactor 1 the pixel lands on its own texel center.
+float SampleDFVisibility(uint2 ViewPixel)
+{
+	// Continuous position of the pixel in the DF texture, in texels. The source pixel of texel T
+	// is T * Factor + Factor / 2 (DFTexelToViewPixel): there the position is exactly T.
+	const float2 TexelPos = (float2(ViewPixel) - float(DFDownsampleFactor / 2)) / float(DFDownsampleFactor);
+	// Texel T has its center at UV (T + 0.5) / Size
+	const float2 UV = (TexelPos + 0.5) / float2(GetDFTextureSize());
+	return DFTexture.SampleLevel(DFSampler, UV, 0).r;
+}
+
+// Compute shader for the ambient occlusion
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void GTDAOCS(uint2 DispatchThreadId : SV_DispatchThreadID)
+{
+	// There is one thread per pixel, so discard thread ids beyond than the output size
+	if (any(DispatchThreadId >= uint2(OutputSize)))
+		return;
+	
+	// From the view pixel to the buffer pixel center
+	const float2 PixelPos = ViewPixelToBufferPos(DispatchThreadId);
+	// Convert pixel coords into UV coords multiplying the pixel position for 1/BufferSize
+	const float2 BufferUV = PixelPos * View.BufferSizeAndInvSize.zw;
+	// Get all buffers data for this pixel from the GBuffer
+	const FGBufferData GBuffer = GetGBufferData(BufferUV);
+
+	// Ambient occlusion: 1 = unoccluded.
+	float AO = 1;
+
+	// Ignore unlit pixels (e.g. the sky) because they receive no indirect light
+	if (GBuffer.ShadingModelID != SHADINGMODELID_UNLIT)
+	{
+		// Transform the normal from world to camera space
+		const float3 N = normalize(mul(float4(GBuffer.WorldNormal, 0), View.TranslatedWorldToView).xyz);
+		// Get the 3D coordinates of the pixel in camera frame
+		const float3 P = CameraSpacePositionFromPixelPosition(PixelPos, GBuffer.Depth);
+		// Compute the Ambient Occlusion
+		AO = ComputeGTDAO(PixelPos, P, N, GetGTDAONoise(float2(DispatchThreadId)));
+#if USE_DF_TEXTURE
+		// Multiply by the visibility of the distance field (large, far or off-screen occluders)
+		AO *= SampleDFVisibility(DispatchThreadId);
+#endif
+		// Scale the occlusion (1 - AO) by the Post Process Volume Intensity
+		AO = 1.0 - (1.0 - AO) * AOIntensity;
+	}
+
+	// Read by GTDAOCompositePS
+	OutAO[DispatchThreadId] = AO;
+}
+
+// Distance field cone samples, one thread per DF texel (DFDownsampleFactor x DFDownsampleFactor pixels)
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void SampleDistanceFieldCS(uint2 DispatchThreadId : SV_DispatchThreadID)
+{
+	// One thread per DF texel: discard the extra threads
+	if (any(DispatchThreadId >= uint2(OutputSize)))
+		return;
+
+	// The pixel the rays of this texel start from
+	const float2 PixelPos = ViewPixelToBufferPos(DFTexelToViewPixel(DispatchThreadId));
+	const FGBufferData GBuffer = GetGBufferData(PixelPos * View.BufferSizeAndInvSize.zw);
+
+	float Visibility = 1.0;
+	
+	// Unlit pixels (the sky) get no AO, as in GTDAOCS
+	if (GBuffer.ShadingModelID != SHADINGMODELID_UNLIT)
+	{
+		const float3 P = CameraSpacePositionFromPixelPosition(PixelPos, GBuffer.Depth);
+		const float3 SurfacePos = mul(float4(P, 1), View.ViewToTranslatedWorld).xyz;
+		// The normal in world space is the same as in Translated world, because axes have the same orientation
+		const float3 WorldN = GBuffer.WorldNormal;
+
+		// The distance field is made of several clipmaps, with a resolution that gets lower far from the camera.
+		// We move the ray start with the voxel size, to avoid sampling inside our own surface.
+		const uint ClipmapIndex = ComputeGlobalDistanceFieldClipmapIndex(SurfacePos);
+		const float VoxelExtent = GlobalVolumeTranslatedCenterAndExtent[ClipmapIndex].w * GlobalVolumeTexelSize;
+		const float3 RayStart = SurfacePos + WorldN * 2.0 * VoxelExtent;
+		const float MinDistance = min(max(DFMinDistance, 4.0 * VoxelExtent), DFMaxDistance - 1.0);
+		
+		// Sample cosine-weighted (to account the lambertian terms) rays over the whole hemisphere of the normal.
+		const float3 Noise = GetGTDAONoise(float2(DispatchThreadId));
+		// Distance ratio between the first and the last cone sample, in log2 (same for every ray)
+		const float LogRange = log2(DFMaxDistance / MinDistance);
+		Visibility = 0.0;
+		for (int Ray = 0; Ray < DFRaysPerTexel; ++Ray)
+		{
+			// Sample a random direction in the hemisphere around the normla. Use the UE funciton CosineSampleHemisphere,
+			// to weight the samples by cosine, so then we can do just the average.
+			const float2 E = frac(Noise.xy + float(Ray) * float2(0.7548776662, 0.5698402910));
+			const float3 RayDir = TangentToWorld(CosineSampleHemisphere(E).xyz, WorldN);
+
+			// Instead of tracing the ray, sample the distance field at a few points along it (see DF_CONE_SAMPLES).
+			// Jitter of the sample distances: the texel noise, moved by the golden ratio for each ray
+			const float Jitter = frac(Noise.z + Ray * 0.6180339887);
+			float RayVisibility = 1.0;
+			UNROLL
+			for (int i = 0; i < DF_CONE_SAMPLES; ++i)
+			{
+				// Geometric progression from MinDistance to DFMaxDistance
+				const float t = MinDistance * exp2(LogRange * (i + Jitter) / DF_CONE_SAMPLES);
+				const float3 SamplePos = RayStart + RayDir * t;
+
+				// The Global SDF stores distances only in a narrow band around the surfaces to save spaces and 
+				// farther away it returns the band size. A cone radius larger than the band would read "occluded" 
+				// in empty space, so we should consider the maximum radius no larger than the band.
+				const uint SampleClipmapIndex = ComputeGlobalDistanceFieldClipmapIndex(SamplePos);
+				const float SampleVoxelExtent = GlobalVolumeTranslatedCenterAndExtent[SampleClipmapIndex].w * GlobalVolumeTexelSize;
+				const float Band = 2.0 * GLOBAL_DISTANCE_FIELD_INFLUENCE_RANGE_IN_VOXELS * SampleVoxelExtent;
+				const float ConeRadius = min(t * DF_CONE_TAN, 0.9 * Band);
+
+				const float Distance = GetDistanceToNearestSurfaceGlobal(SamplePos);
+				RayVisibility = min(RayVisibility, saturate(Distance / ConeRadius));
+			}
+			Visibility += RayVisibility;
+		}
+		Visibility /= DFRaysPerTexel;
+	}
+
+	OutDF[DispatchThreadId] = Visibility;
+}
+
+// Composite pass: writes out AO into UE's scene AO texture
+float4 GTDAOCompositePS(float4 SvPosition : SV_POSITION) : SV_Target0
+{
+	const int2 OutputPixel = int2(SvPosition.xy - View.ViewRectMin.xy);
+	const float AO = AOTexture.Load(int3(OutputPixel, 0)).r;
+	return AO;
+}
