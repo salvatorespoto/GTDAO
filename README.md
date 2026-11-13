@@ -19,6 +19,10 @@ samples add the occlusion of what the screen cannot see, like large or off-scree
 ![B1: lit, ray traced sky visibility, GTDAO](Docs/Images/B1_lit_refinf_gtdao.jpg)
 ![B4: lit, ray traced sky visibility, GTDAO](Docs/Images/B4_lit_refinf_gtdao.jpg)
 
+Video: [GTDAO on YouTube](https://www.youtube.com/watch?v=pwLbf1qlrkU&list=PLOQ0BQa7qg4E)
+
+[![GTDAO video](https://img.youtube.com/vi/pwLbf1qlrkU/hqdefault.jpg)](https://www.youtube.com/watch?v=pwLbf1qlrkU&list=PLOQ0BQa7qg4E)
+
 ## What the AO buffer is
 
 The ambient occlusion buffer is the fraction of the indirect light that is not occluded: it is brighter
